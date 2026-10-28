@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from instrumental_evasion.apptainer_core import (
 # cats a binary should get a truncated result and keep going, not lose the
 # episode.
 MAX_EXEC_OUTPUT_SIZE = 10 * 1024**2
+
+# How long to wait for a killed process group to close its pipes. Bounded so a
+# descendant that survives the kill cannot block the episode indefinitely.
+_REAP_TIMEOUT = 10
 
 # A bound on concurrent `apptainer exec` processes. Without one, a batch of
 # episodes each spawning execs will exhaust the node's file descriptors and
@@ -68,6 +73,14 @@ def _decode(raw: bytes, limit: int | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _kill_group(process: asyncio.subprocess.Process) -> None:
+    """Send SIGKILL to the process group led by `process`."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 async def run_process(
     args: list[str],
     *,
@@ -90,17 +103,26 @@ async def run_process(
             stdin=asyncio.subprocess.PIPE if input is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Own process group, so a timeout kills the whole tree inside the
+            # container, not only `apptainer exec`; surviving descendants would
+            # hold stdout/stderr open and the reaping `communicate` never returns.
+            start_new_session=True,
         )
         payload = input.encode() if isinstance(input, str) else input
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(payload), timeout=timeout
             )
+        except asyncio.CancelledError:
+            # The new session no longer receives the terminal's SIGINT, so the
+            # group is killed here when the run is interrupted.
+            _kill_group(process)
+            raise
         except asyncio.TimeoutError:
-            process.kill()
+            _kill_group(process)
             # Reap it, or the child is left as a zombie for the run's lifetime.
             try:
-                await process.communicate()
+                await asyncio.wait_for(process.communicate(), timeout=_REAP_TIMEOUT)
             except Exception:  # noqa: BLE001
                 pass
             return ExecResult(
